@@ -10,7 +10,7 @@ const EDIT_MS = 3000
 // the latest reasoning. Telegram allows roughly one edit a second per chat.
 const HEARTBEAT_MS = 3_000
 
-type Piece = { message: string; kind: "text" | "reasoning"; text: string }
+type Piece = { message: string; kind: "text" | "reasoning"; text: string; pending?: boolean }
 type Stream = {
   // every text and reasoning part of the run, in arrival order, with the assistant message it belongs to
   pieces: Map<string, Piece>
@@ -19,6 +19,9 @@ type Stream = {
   steps: string[]
   error?: string
   sent: string
+  // the send or edit of the thinking message on its way: the next tick skips instead of queueing
+  // behind it, and finish() waits for it so a late edit cannot undo the final one
+  inflight?: Promise<void>
   messageID?: number
   started: number
   waiting?: boolean
@@ -243,7 +246,10 @@ export default (async ({ client, directory, project, serverUrl }) => {
     // A fresh connection per call and a deadline: reusing a pooled keep-alive socket that
     // Telegram (or a NAT on the way) has already closed failed with "The socket connection
     // was closed unexpectedly", most often on the 30 s long poll.
-    const wait = method === "getUpdates" ? ((body.timeout as number) || 0) * 1000 + 15_000 : 30_000
+    // Bun's fetch here now and then hangs ~20 s on a connection and then fails ("socket
+    // connection was closed unexpectedly"), about one call in seven, while curl on the same
+    // host never does. A short deadline and a quick retry turn that into a second's delay.
+    const wait = method === "getUpdates" ? ((body.timeout as number) || 0) * 1000 + 15_000 : method === "editMessageText" ? 4_000 : 6_000
     let res: Response
     try {
       res = await fetch(`${API}/bot${token}/${method}`, {
@@ -255,8 +261,9 @@ export default (async ({ client, directory, project, serverUrl }) => {
       })
     } catch (err) {
       // a dropped or timed-out connection: retry, so a reply or a button is not lost to it
-      if (attempt < 3 && method !== "getUpdates") {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+      // an edit is not retried: the next tick sends fresher text anyway
+      if (attempt < 3 && method !== "getUpdates" && method !== "editMessageText") {
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)))
         return call<T>(method, body, attempt + 1)
       }
       throw err
@@ -379,13 +386,20 @@ export default (async ({ client, directory, project, serverUrl }) => {
     const chat = chats.get(chatID)
     if (!chat?.stream) return
     const html = renderThinking(chat.stream)
-    if (html === chat.stream.sent) return
-    chat.stream.sent = html
-    if (chat.stream.messageID) {
-      await editHtml(chatID, chat.stream.messageID, html)
-      return
-    }
-    chat.stream.messageID = await sendHtml(chatID, html)
+    const stream = chat.stream
+    if (html === stream.sent || stream.inflight) return
+    stream.inflight = (async () => {
+      if (stream.messageID) {
+        if (await editHtml(chatID, stream.messageID, html)) stream.sent = html
+      } else {
+        // the first send goes through here too, so a slow one is never sent a second time
+        stream.messageID = await sendHtml(chatID, html)
+        stream.sent = html
+      }
+    })().finally(() => {
+      stream.inflight = undefined
+    })
+    await stream.inflight
   }
 
   // Throttle, not debounce: while tokens stream without a pause a debounce kept postponing
@@ -412,6 +426,8 @@ export default (async ({ client, directory, project, serverUrl }) => {
     stream.done = true
     stream.waiting = false
     chat.stream = undefined
+    // let a send or edit already on its way land first: the final form must be the last edit
+    await stream.inflight?.catch(() => {})
     const answer = answerOf(stream)
     const thought = pieces(stream, "reasoning").length > 0 || stream.steps.length > 0 || notesOf(stream).length > 0
     // 1. the thinking message gets its final form, or goes away if there was nothing to show
@@ -451,8 +467,7 @@ export default (async ({ client, directory, project, serverUrl }) => {
       state.busy = true
       state.touched = Date.now()
       state.stream = { pieces: new Map(), messages: [], steps: [], sent: "", started: Date.now() }
-      state.stream.sent = renderThinking(state.stream)
-      state.stream.messageID = await sendHtml(chatID, state.stream.sent)
+      void flush(chatID).catch((err) => log("warn", `thinking message: ${String(err)}`))
       const idle = new Promise<void>((resolve) => (state.idle = resolve))
       const model = models.get(chatID) || fallbackModel
       const split = model?.includes("/") ? model.split("/") : undefined
@@ -751,6 +766,25 @@ export default (async ({ client, directory, project, serverUrl }) => {
       if (perm && sessions.has(perm.sessionID)) await askPermission(perm)
       return
     }
+    if (payload.type === "message.part.delta") {
+      // opencode 1.18 streams text and reasoning as deltas; message.part.updated only marks a
+      // part's start and end, so without this the thinking message froze after one update
+      const target = sessionID ? sessions.get(sessionID) : undefined
+      const stream = target !== undefined ? chats.get(target)?.stream : undefined
+      if (!stream || !props?.partID || typeof props.delta !== "string") return
+      if (props.field && props.field !== "text") return
+      touch(target!)
+      const piece = stream.pieces.get(props.partID)
+      if (piece) piece.text += props.delta
+      else {
+        // a delta before the part's own event: remember it, the kind comes with message.part.updated
+        const message = String(props.messageID ?? "")
+        if (message && !stream.messages.includes(message)) stream.messages.push(message)
+        stream.pieces.set(props.partID, { message, kind: "reasoning", text: props.delta, pending: true } as Piece)
+      }
+      schedule(target!)
+      return
+    }
     if (payload.type === "message.part.removed") {
       const target = sessionID ? sessions.get(sessionID) : undefined
       if (target !== undefined && props?.partID) chats.get(target)?.stream?.pieces.delete(props.partID)
@@ -790,7 +824,10 @@ export default (async ({ client, directory, project, serverUrl }) => {
         if (part.synthetic) return
         const message = String(part.messageID ?? "")
         if (message && !stream.messages.includes(message)) stream.messages.push(message)
-        stream.pieces.set(part.id, { message, kind: part.type, text: part.text ?? "" })
+        // the part's full text wins over the deltas collected so far, unless it is still shorter
+        const had = stream.pieces.get(part.id)
+        const text = part.text ?? ""
+        stream.pieces.set(part.id, { message, kind: part.type, text: had && had.text.length > text.length ? had.text : text })
         schedule(chatID)
       } else if (part.type === "tool") {
         const title = part.state?.title
@@ -962,7 +999,8 @@ export default (async ({ client, directory, project, serverUrl }) => {
   const heartbeat = async () => {
     while (running) {
       await new Promise((r) => setTimeout(r, HEARTBEAT_MS))
-      for (const [chatID, state] of chats) if (state.busy && state.stream) await flush(chatID).catch(() => {})
+      // not awaited: one slow edit must not hold back the others or the next tick
+      for (const [chatID, state] of chats) if (state.busy && state.stream) void flush(chatID).catch(() => {})
       for (const entry of pending.values()) {
         if (Date.now() - entry.refreshed < 15_000) continue
         entry.refreshed = Date.now()
@@ -970,7 +1008,7 @@ export default (async ({ client, directory, project, serverUrl }) => {
         const shown = `${entry.text}\n\n⏳ ждёт ответа ${clock(waited)} · отклонится само через ${clock(PERMISSION_MS - waited)}`
         if (shown === entry.shown) continue
         entry.shown = shown
-        await edit(entry.chatID, entry.messageID, shown, entry.keyboard).catch(() => {})
+        void edit(entry.chatID, entry.messageID, shown, entry.keyboard).catch(() => {})
       }
     }
   }
