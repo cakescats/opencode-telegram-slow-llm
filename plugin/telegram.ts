@@ -17,6 +17,8 @@ type Stream = {
   // assistant messages of this run in order: the last one carries the final answer
   messages: string[]
   steps: string[]
+  // what was decided on each permission request, kept in the thinking message as its history
+  decisions: string[]
   error?: string
   sent: string
   // the send or edit of the thinking message on its way: the next tick skips instead of queueing
@@ -51,6 +53,10 @@ type Pending = {
   keyboard: unknown
   shown: string
   refreshed: number
+  type: string
+  ttl: number
+  fallback: "reject" | "once"
+  label: string
 }
 
 const HELP = [
@@ -66,6 +72,7 @@ const HELP = [
   "/sessions — список сессий проекта",
   "/use <id> — подключиться к сессии",
   "/status — состояние сессии",
+  "/settings — настройки: разрешения, ответ по умолчанию и его срок, быстрый режим",
   "/permissions — режим подтверждений",
   "/fast — быстрые ответы без размышлений (вкл/выкл)",
   "/password <новый> — сменить пароль доступа",
@@ -83,11 +90,12 @@ const BUTTONS: Record<string, string> = {
   "📊 Статус": "/status",
   "📂 Сессии": "/sessions",
   "❓ Помощь": "/help",
+  "⚙️ Настройки": "/settings",
 }
 const KEYBOARD = {
   keyboard: [
     [{ text: "⏹ Стоп" }, { text: "🆕 Новая" }, { text: "⚡ Быстро" }],
-    [{ text: "📊 Статус" }, { text: "📂 Сессии" }, { text: "❓ Помощь" }],
+    [{ text: "📊 Статус" }, { text: "📂 Сессии" }, { text: "⚙️ Настройки" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -102,7 +110,8 @@ const MENU = [
   { command: "sessions", description: "Сессии проекта" },
   { command: "use", description: "Подключиться к сессии: /use <id>" },
   { command: "model", description: "Модель: показать или сменить" },
-  { command: "permissions", description: "Подтверждения: ask | allow | deny" },
+  { command: "settings", description: "Настройки: разрешения, ответ по умолчанию, быстрый режим" },
+  { command: "permissions", description: "Разрешения: ask | edits | allow | deny" },
   { command: "menu", description: "Показать кнопки команд" },
   { command: "help", description: "Справка" },
 ]
@@ -139,7 +148,10 @@ export default (async ({ client, directory, project, serverUrl }) => {
   const agent = process.env.TELEGRAM_AGENT?.trim() || "build"
   const debug = process.env.TELEGRAM_DEBUG === "1"
   const fallbackModel = process.env.TELEGRAM_MODEL?.trim()
-  const policy = (process.env.TELEGRAM_PERMISSIONS?.trim() || "ask") as "ask" | "allow" | "deny"
+  type Mode = "ask" | "edits" | "allow" | "deny"
+  const MODES: Mode[] = ["ask", "edits", "allow", "deny"]
+  const envMode = process.env.TELEGRAM_PERMISSIONS?.trim() as Mode
+  const policy: Mode = MODES.includes(envMode) ? envMode : "ask"
   const allowed = new Set(
     (process.env.TELEGRAM_ALLOWED?.trim() || "")
       .split(/[\s,]+/)
@@ -169,10 +181,45 @@ export default (async ({ client, directory, project, serverUrl }) => {
   const chats = new Map<number, Chat>()
   // messages written by the user (their parts are echoed on the event stream too)
   const userMessages = new Set<string>()
+  // parts that are neither text nor reasoning (tools, files, steps): their deltas are dropped
+  const otherParts = new Set<string>()
   const sessions = new Map<string, number>()
   const models = new Map<number, string>()
-  const modes = new Map<number, "ask" | "allow" | "deny">()
-  const fast = new Set<number>()
+  // Per-chat settings, kept in telegram-settings.json: permission mode, what happens to a
+  // request nobody answers and after how long, the fast mode, the model.
+  type Prefs = { mode?: Mode; onTimeout?: "reject" | "once"; timeoutSec?: number; fast?: boolean; model?: string }
+  const settingsFile = join(homedir(), ".config", "opencode", "telegram-settings.json")
+  const prefs = new Map<number, Prefs>()
+  try {
+    if (existsSync(settingsFile))
+      for (const [id, p] of Object.entries(JSON.parse(readFileSync(settingsFile, "utf8")) as Record<string, Prefs>)) prefs.set(Number(id), p)
+  } catch {}
+  const savePrefs = () => {
+    try {
+      writeFileSync(settingsFile, JSON.stringify(Object.fromEntries(prefs)), { mode: 0o600 })
+    } catch {}
+  }
+  const pref = (chatID: number) => prefs.get(chatID) ?? {}
+  const setPref = (chatID: number, patch: Prefs) => {
+    prefs.set(chatID, { ...pref(chatID), ...patch })
+    savePrefs()
+  }
+  const modeOf = (chatID: number): Mode => pref(chatID).mode ?? policy
+  const timeoutOf = (chatID: number) => (pref(chatID).timeoutSec ? pref(chatID).timeoutSec! * 1000 : PERMISSION_MS)
+  const onTimeoutOf = (chatID: number) => pref(chatID).onTimeout ?? "reject"
+  // file changes and reads; everything else (commands, web, subagents, other folders) is asked about in "edits"
+  const EDIT_KINDS = new Set(["edit", "write", "patch", "multiedit", "read", "list", "glob", "grep", "todowrite", "todoread"])
+  const decide = (chatID: number, type: string): "ask" | "allow" | "deny" => {
+    const mode = modeOf(chatID)
+    if (mode === "edits") return EDIT_KINDS.has(type) ? "allow" : "ask"
+    return mode
+  }
+  const MODE_LABEL: Record<Mode, string> = {
+    ask: "🔐 Спрашивать всё",
+    edits: "✏️ Правки без вопросов, команды спрашивать",
+    allow: "✅ Разрешено всё без запросов",
+    deny: "👁 Только чтение (всё отклонять)",
+  }
   const pending = new Map<string, Pending>()
   const attempts = new Map<number, { n: number; until: number }>()
   const usersFile = join(homedir(), ".config", "opencode", "telegram-users.json")
@@ -347,7 +394,7 @@ export default (async ({ client, directory, project, serverUrl }) => {
   }
   // The final answer is the text of the run's last assistant message; texts of earlier
   // messages (between tool steps) are interim notes and stay in the thinking message.
-  const pieces = (stream: Stream, kind: Piece["kind"]) => [...stream.pieces.values()].filter((p) => p.kind === kind && p.text.trim())
+  const pieces = (stream: Stream, kind: Piece["kind"]) => [...stream.pieces.values()].filter((p) => !p.pending && p.kind === kind && p.text.trim())
   const answerOf = (stream: Stream) => {
     const last = stream.messages.at(-1)
     return pieces(stream, "text").filter((p) => p.message === last).map((p) => p.text.trim()).join("\n\n")
@@ -386,13 +433,16 @@ export default (async ({ client, directory, project, serverUrl }) => {
           : "думает"
     const head = stream.done ? `💭 <b>Размышления</b> · ${took}` : `💭 <b>Думаю</b> · ${took} · ${doing}`
     const steps = stream.steps.length ? `\n⚙ ${esc(stream.steps.join(" → "))}` : ""
+    const decided = stream.decisions.length
+      ? `\n${stream.decisions.length > 6 ? `… ещё ${stream.decisions.length - 6}\n` : ""}${esc(stream.decisions.slice(-6).join("\n"))}`
+      : ""
     const note = notesOf(stream).at(-1)
     const interim = note ? `\n📝 ${esc(note.length > 400 ? `…${note.slice(-400)}` : note)}` : ""
     // Only the paragraph being thought right now, not the whole reasoning growing downwards.
     const para = lastParagraph(pieces(stream, "reasoning").at(-1)?.text ?? "")
     const quote = para ? `\n<blockquote>${esc(para)}</blockquote>` : ""
     const tail = stream.error ? `\n\n${esc(errorLine(stream))}` : ""
-    return `${head}${steps}${interim}${quote}${tail}`
+    return `${head}${steps}${decided}${interim}${quote}${tail}`
   }
 
   // Only ever edits the thinking message; a new one is sent only if there is none yet.
@@ -443,7 +493,7 @@ export default (async ({ client, directory, project, serverUrl }) => {
     // let a send or edit already on its way land first: the final form must be the last edit
     await stream.inflight?.catch(() => {})
     const answer = answerOf(stream)
-    const thought = pieces(stream, "reasoning").length > 0 || stream.steps.length > 0 || notesOf(stream).length > 0
+    const thought = pieces(stream, "reasoning").length > 0 || stream.steps.length > 0 || stream.decisions.length > 0 || notesOf(stream).length > 0
     // 1. the thinking message gets its final form, or goes away if there was nothing to show
     if (stream.messageID) {
       if (thought || (!answer && stream.error)) await editHtml(chatID, stream.messageID, renderThinking(stream))
@@ -480,16 +530,16 @@ export default (async ({ client, directory, project, serverUrl }) => {
       }
       state.busy = true
       state.touched = Date.now()
-      state.stream = { pieces: new Map(), messages: [], steps: [], sent: "", started: Date.now() }
+      state.stream = { pieces: new Map(), messages: [], steps: [], decisions: [], sent: "", started: Date.now() }
       void flush(chatID).catch((err) => log("warn", `thinking message: ${String(err)}`))
       const idle = new Promise<void>((resolve) => (state.idle = resolve))
-      const model = models.get(chatID) || fallbackModel
+      const model = pref(chatID).model || fallbackModel
       const split = model?.includes("/") ? model.split("/") : undefined
       // "/no_think" at the end of a message is the model server's switch for a direct answer.
       const body = {
         agent,
         ...(split ? { model: { providerID: split[0], modelID: split.slice(1).join("/") } } : {}),
-        parts: [{ type: "text" as const, text: fast.has(chatID) ? `${text} /no_think` : text }],
+        parts: [{ type: "text" as const, text: pref(chatID).fast ? `${text} /no_think` : text }],
       }
       // prompt_async returns at once; the run ends with session.idle -> finish(). The
       // blocking prompt() kept this handler (and with it the Telegram poll loop) waiting
@@ -524,10 +574,8 @@ export default (async ({ client, directory, project, serverUrl }) => {
       }
       state?.idle?.()
       chats.delete(chatID)
-      models.delete(chatID)
-      modes.delete(chatID)
       saveSessions()
-      await send(chatID, "🆕 Новая сессия.")
+      await send(chatID, "🆕 Новая сессия. Настройки чата сохранены (⚙️ Настройки).")
     },
     "/stop": async (chatID) => {
       const state = chats.get(chatID)
@@ -537,18 +585,17 @@ export default (async ({ client, directory, project, serverUrl }) => {
       await finish(chatID)
     },
     "/fast": async (chatID) => {
-      if (fast.has(chatID)) fast.delete(chatID)
-      else fast.add(chatID)
+      setPref(chatID, { fast: !pref(chatID).fast })
       await send(
         chatID,
-        fast.has(chatID)
+        pref(chatID).fast
           ? "⚡ Быстрый режим: отвечаю без размышлений. Для сложных задач выключите: /fast"
           : "🧠 Обычный режим: с размышлениями (медленнее, но умнее).",
       )
     },
     "/model": async (chatID, arg) => {
-      if (!arg) return send(chatID, `Модель: ${models.get(chatID) || fallbackModel || "из конфига"}`).then(() => {})
-      models.set(chatID, arg)
+      if (!arg) return send(chatID, `Модель: ${pref(chatID).model || fallbackModel || "из конфига"}`).then(() => {})
+      setPref(chatID, { model: arg })
       await send(chatID, `Модель: ${arg}\nПрименится со следующего сообщения.`)
     },
     "/status": async (chatID) => {
@@ -559,8 +606,9 @@ export default (async ({ client, directory, project, serverUrl }) => {
         [
           `Сессия: ${chat.sessionID}`,
           `Агент: ${agent}`,
-          `Модель: ${models.get(chatID) || fallbackModel || "default"}`,
-          `Режим: ${fast.has(chatID) ? "быстрый (без размышлений)" : "с размышлениями"}`,
+          `Модель: ${pref(chatID).model || fallbackModel || "default"}`,
+          `Режим: ${pref(chatID).fast ? "быстрый (без размышлений)" : "с размышлениями"}`,
+          `Разрешения: ${MODE_LABEL[modeOf(chatID)]}`,
           `Состояние: ${chat.busy ? "занята" : "свободна"}`,
           `Проект: ${project.worktree || directory}`,
         ].join("\n"),
@@ -600,16 +648,14 @@ export default (async ({ client, directory, project, serverUrl }) => {
       await send(chatID, `✅ Подключено: ${found.title || found.id}\n${found.id}`)
     },
     "/permissions": async (chatID, arg) => {
-      const next = arg.trim().toLowerCase()
-      if (!next) {
-        return send(chatID, `Разрешения: ${modes.get(chatID) || policy}\nВарианты: /permissions ask | allow | deny`).then(() => {})
-      }
-      if (next !== "ask" && next !== "allow" && next !== "deny") {
-        return send(chatID, "Допустимо: ask, allow, deny").then(() => {})
-      }
-      modes.set(chatID, next)
-      const hint = next === "allow" ? "Агент будет делать всё без подтверждений." : next === "deny" ? "Агент сможет только читать." : "Каждое опасное действие придёт кнопкой."
-      await send(chatID, `Режим разрешений: ${next}\n${hint}`)
+      const next = arg.trim().toLowerCase() as Mode
+      if (!next) return send(chatID, `Разрешения: ${MODE_LABEL[modeOf(chatID)]}\nВарианты: /permissions ask | edits | allow | deny, или ⚙️ Настройки`).then(() => {})
+      if (!MODES.includes(next)) return send(chatID, "Допустимо: ask, edits, allow, deny").then(() => {})
+      setPref(chatID, { mode: next })
+      await send(chatID, `Разрешения: ${MODE_LABEL[next]}`)
+    },
+    "/settings": async (chatID) => {
+      await send(chatID, settingsText(chatID), settingsKeyboard(chatID))
     },
     "/password": async (chatID, arg) => {
       const next = arg.trim()
@@ -641,6 +687,66 @@ export default (async ({ client, directory, project, serverUrl }) => {
     },
   }
 
+  const TIMEOUTS = [30, 60, 120, 300, 600]
+  const settingsText = (chatID: number) => {
+    const p = pref(chatID)
+    return [
+      "⚙️ Настройки этого чата",
+      "",
+      `Разрешения: ${MODE_LABEL[modeOf(chatID)]}`,
+      `Если не ответить на запрос: ${onTimeoutOf(chatID) === "once" ? "✅ разрешить" : "⛔ отклонить"} через ${clock(timeoutOf(chatID))}`,
+      `Быстрый режим (без размышлений): ${p.fast ? "вкл" : "выкл"}`,
+      modeOf(chatID) === "allow" ? "\n⚠️ Агент выполняет любые команды без вопросов — давайте пароль только тем, кому доверяете." : "",
+    ].join("\n").trim()
+  }
+  const settingsKeyboard = (chatID: number) => {
+    const mark = (on: boolean, t: string) => (on ? `● ${t}` : t)
+    const mode = modeOf(chatID)
+    const tsec = Math.round(timeoutOf(chatID) / 1000)
+    return {
+      inline_keyboard: [
+        [{ text: mark(mode === "ask", "🔐 Спрашивать"), callback_data: "s:mode:ask" }, { text: mark(mode === "edits", "✏️ Правки сами"), callback_data: "s:mode:edits" }],
+        [{ text: mark(mode === "allow", "✅ Всё без запросов"), callback_data: "s:mode:allow" }, { text: mark(mode === "deny", "👁 Только чтение"), callback_data: "s:mode:deny" }],
+        [
+          { text: mark(onTimeoutOf(chatID) === "reject", "По умолч.: ⛔ отклонить"), callback_data: "s:def:reject" },
+          { text: mark(onTimeoutOf(chatID) === "once", "✅ разрешить"), callback_data: "s:def:once" },
+        ],
+        TIMEOUTS.map((t) => ({ text: mark(tsec === t, t < 60 ? `${t} с` : `${t / 60} мин`), callback_data: `s:ttl:${t}` })),
+        [{ text: pref(chatID).fast ? "⚡ Быстрый режим: вкл" : "🧠 Быстрый режим: выкл", callback_data: "s:fast:toggle" }, { text: "✖ Закрыть", callback_data: "s:close:1" }],
+      ],
+    }
+  }
+  const onSettings = async (cb: any, key: string, value: string) => {
+    const chatID = cb.message?.chat?.id as number | undefined
+    const messageID = cb.message?.message_id as number | undefined
+    if (chatID === undefined || messageID === undefined) return
+    if (!users.has(chatID) && !(cb.from?.id && users.has(cb.from.id))) {
+      await call("answerCallbackQuery", { callback_query_id: cb.id, text: "Сначала войдите по паролю" }).catch(() => {})
+      return
+    }
+    let toast = "Сохранено"
+    if (key === "mode" && MODES.includes(value as Mode)) setPref(chatID, { mode: value as Mode }), (toast = MODE_LABEL[value as Mode])
+    else if (key === "def" && (value === "reject" || value === "once")) setPref(chatID, { onTimeout: value }), (toast = value === "once" ? "По умолчанию: разрешить" : "По умолчанию: отклонить")
+    else if (key === "ttl" && TIMEOUTS.includes(Number(value))) setPref(chatID, { timeoutSec: Number(value) }), (toast = `Срок ответа: ${clock(Number(value) * 1000)}`)
+    else if (key === "fast") setPref(chatID, { fast: !pref(chatID).fast }), (toast = pref(chatID).fast ? "Быстрый режим включён" : "Быстрый режим выключен")
+    else if (key === "close") {
+      await call("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {})
+      await edit(chatID, messageID, `${settingsText(chatID)}\n\nИзменить: ⚙️ Настройки`).catch(() => {})
+      return
+    }
+    await call("answerCallbackQuery", { callback_query_id: cb.id, text: toast }).catch(() => {})
+    await edit(chatID, messageID, settingsText(chatID), settingsKeyboard(chatID)).catch(() => {})
+    // requests already waiting follow the new mode at once
+    if (key === "mode") {
+      for (const [token, entry] of pending) {
+        if (entry.chatID !== chatID) continue
+        const verdict = decide(chatID, entry.type)
+        if (verdict === "allow") await settle(token, "once")
+        else if (verdict === "deny") await settle(token, "reject")
+      }
+    }
+  }
+
   const handle = async (chatID: number, text: string) => {
     touch(chatID)
     text = BUTTONS[text.trim()] ?? text
@@ -665,15 +771,25 @@ export default (async ({ client, directory, project, serverUrl }) => {
     return !res.error
   }
 
+  const permLabel = (perm: { type: string; pattern?: string | string[] }) => {
+    const what = [perm.pattern].flat().filter(Boolean).join(", ").replace(/\s+/g, " ").trim()
+    return what ? `${perm.type}: ${what.length > 60 ? `${what.slice(0, 60)}…` : what}` : perm.type
+  }
   const askPermission = async (perm: { id: string; sessionID: string; type: string; title: string; pattern?: string | string[] }) => {
     const chatID = sessions.get(perm.sessionID)
     if (chatID === undefined) return
     if (asked.has(perm.id)) return
     asked.add(perm.id)
-    const mode = modes.get(chatID) || policy
-    if (mode !== "ask") {
-      log("info", `auto-${mode} permission ${perm.type} in chat ${chatID}`)
-      await reply(perm.sessionID, perm.id, mode === "allow" ? "always" : "reject")
+    const verdict = decide(chatID, perm.type)
+    if (verdict !== "ask") {
+      log("info", `auto-${verdict} permission ${perm.type} in chat ${chatID}`)
+      await reply(perm.sessionID, perm.id, verdict === "allow" ? "once" : "reject")
+      // a line in the thinking message instead of a button: what was done on its own
+      const stream = chats.get(chatID)?.stream
+      if (stream) {
+        stream.decisions.push(`${verdict === "allow" ? "✅" : "⛔"} ${permLabel(perm)} · ${verdict === "allow" ? "разрешено" : "отклонено"} автоматически`)
+        schedule(chatID)
+      }
       return
     }
     const token = Math.random().toString(36).slice(2, 10)
@@ -689,7 +805,8 @@ export default (async ({ client, directory, project, serverUrl }) => {
     }
     log("info", `permission ${perm.id} (${perm.type}) chat ${chatID}`)
     const text = `🔐 ${perm.title}\n${perm.type}${detail}`
-    const shown = `${text}\n\n⏳ ждёт ответа · отклонится само через ${clock(PERMISSION_MS)}`
+    const label = permLabel(perm)
+    const shown = countdown(text, 0, timeoutOf(chatID), onTimeoutOf(chatID))
     const sent = await send(chatID, shown, keyboard).catch(() => undefined)
     if (sent === undefined) {
       await reply(perm.sessionID, perm.id, "reject")
@@ -699,8 +816,12 @@ export default (async ({ client, directory, project, serverUrl }) => {
       sessionID: perm.sessionID,
       permissionID: perm.id,
       chatID,
-      timer: setTimeout(() => {}, PERMISSION_MS),
+      timer: setTimeout(() => {}, timeoutOf(chatID)),
       at: Date.now(),
+      type: perm.type,
+      ttl: timeoutOf(chatID),
+      fallback: onTimeoutOf(chatID),
+      label,
       messageID: sent,
       text,
       keyboard,
@@ -716,6 +837,8 @@ export default (async ({ client, directory, project, serverUrl }) => {
   }
 
   const VERDICT = { once: "✅ Разрешено один раз", always: "♾️ Разрешено всегда", reject: "⛔ Отклонено" } as const
+  const countdown = (text: string, waited: number, ttl: number, fallback: "reject" | "once") =>
+    `${text}\n\n⏳ ждёт ${clock(waited)} · через ${clock(Math.max(0, ttl - waited))} само: ${fallback === "once" ? "✅ разрешить" : "⛔ отклонить"}`
   // Take a request off the list and rewrite its message with the outcome (no new message).
   const close = async (token: string, outcome: string) => {
     const entry = pending.get(token)
@@ -729,14 +852,31 @@ export default (async ({ client, directory, project, serverUrl }) => {
       schedule(entry.chatID)
     }
     touch(entry.chatID)
-    await edit(entry.chatID, entry.messageID, `${entry.text}\n\n${outcome} · ${hhmm()} (ждал ${clock(Date.now() - entry.at)})`)
+    const line = `${outcome.split(" ")[0]} ${entry.label} · ${outcome.split(" ").slice(1).join(" ").toLowerCase()} · ждал ${clock(Date.now() - entry.at)}`
+    if (stream) {
+      // the decision joins the thinking message; the button message goes, so the thinking stays the last one
+      stream.decisions.push(line)
+      schedule(entry.chatID)
+      await call("deleteMessage", { chat_id: entry.chatID, message_id: entry.messageID }).catch(async () => {
+        await edit(entry.chatID, entry.messageID, `${entry.text}\n\n${outcome} · ${hhmm()}`).catch(() => {})
+      })
+    } else {
+      // no live task to attach it to (it finished, or the bridge restarted): mark the request itself
+      await edit(entry.chatID, entry.messageID, `${entry.text}\n\n${outcome} · ${hhmm()} (ждал ${clock(Date.now() - entry.at)})`)
+    }
     return entry
   }
   const settle = async (token: string, response: "once" | "always" | "reject") => {
     const entry = await close(token, VERDICT[response])
     if (!entry) return
     const ok = await reply(entry.sessionID, entry.permissionID, response)
-    if (!ok) await edit(entry.chatID, entry.messageID, `${entry.text}\n\n⚠️ ${VERDICT[response]}, но opencode не принял ответ — запрос мог уже закрыться.`)
+    if (!ok) {
+      const stream = chats.get(entry.chatID)?.stream
+      if (stream) {
+        stream.decisions.push(`⚠️ ${entry.label} · opencode не принял ответ (запрос мог уже закрыться)`)
+        schedule(entry.chatID)
+      } else await send(entry.chatID, `⚠️ ${VERDICT[response]}, но opencode не принял ответ — запрос мог уже закрыться.`).catch(() => {})
+    }
   }
 
   const normalize = (p: Record<string, any> | undefined) => {
@@ -788,13 +928,12 @@ export default (async ({ client, directory, project, serverUrl }) => {
       if (!stream || !props?.partID || typeof props.delta !== "string") return
       if (props.field && props.field !== "text") return
       touch(target!)
+      if (otherParts.has(props.partID)) return   // a tool's output or code: never shown as thinking
       const piece = stream.pieces.get(props.partID)
       if (piece) piece.text += props.delta
       else {
-        // a delta before the part's own event: remember it, the kind comes with message.part.updated
-        const message = String(props.messageID ?? "")
-        if (message && !stream.messages.includes(message)) stream.messages.push(message)
-        stream.pieces.set(props.partID, { message, kind: "reasoning", text: props.delta, pending: true } as Piece)
+        // a delta before the part's own event: kept hidden until message.part.updated says what it is
+        stream.pieces.set(props.partID, { message: String(props.messageID ?? ""), kind: "reasoning", text: props.delta, pending: true })
       }
       schedule(target!)
       return
@@ -827,7 +966,7 @@ export default (async ({ client, directory, project, serverUrl }) => {
       // A run this process did not start (it was running before a restart): pick up its
       // output so it still reaches the chat.
       owner.busy = true
-      owner.stream = { pieces: new Map(), messages: [], steps: [], sent: "", started: Date.now() }
+      owner.stream = { pieces: new Map(), messages: [], steps: [], decisions: [], sent: "", started: Date.now() }
     }
     const stream = owner.stream
     if (!stream) return
@@ -843,7 +982,12 @@ export default (async ({ client, directory, project, serverUrl }) => {
         const text = part.text ?? ""
         stream.pieces.set(part.id, { message, kind: part.type, text: had && had.text.length > text.length ? had.text : text })
         schedule(chatID)
-      } else if (part.type === "tool") {
+      } else {
+        otherParts.add(part.id)
+        if (otherParts.size > 2000) otherParts.delete(otherParts.values().next().value as string)
+        stream.pieces.delete(part.id)   // deltas that arrived before we knew it was a tool
+      }
+      if (part.type === "tool") {
         const title = part.state?.title
         if (title && stream.steps.at(-1) !== title) {
           stream.steps.push(title)
@@ -922,6 +1066,10 @@ export default (async ({ client, directory, project, serverUrl }) => {
           const cb = update.callback_query
           if (cb) {
             const [kind, token, verdict] = String(cb.data || "").split(":")
+            if (kind === "s") {
+              void onSettings(cb, token, verdict).catch((err) => log("error", `settings: ${String(err)}`))
+              continue
+            }
             const live = kind === "p" && pending.has(token) && verdict in VERDICT
             await call("answerCallbackQuery", {
               callback_query_id: cb.id,
@@ -992,12 +1140,6 @@ export default (async ({ client, directory, project, serverUrl }) => {
     while (running) {
       await new Promise((r) => setTimeout(r, 30_000))
       await reconcile()
-      for (const [token, entry] of pending) {
-        if (Date.now() - entry.at < PERMISSION_MS) continue
-        log("warn", `permission ${entry.permissionID} timed out, rejecting`)
-        await close(token, "⏱️ Время вышло — отклонено")
-        await reply(entry.sessionID, entry.permissionID, "reject")
-      }
       for (const [chatID, state] of chats) {
         if (!state.busy || !state.sessionID) continue
         if ([...pending.values()].some((p) => p.chatID === chatID)) continue
@@ -1015,11 +1157,19 @@ export default (async ({ client, directory, project, serverUrl }) => {
       await new Promise((r) => setTimeout(r, HEARTBEAT_MS))
       // not awaited: one slow edit must not hold back the others or the next tick
       for (const [chatID, state] of chats) if (state.busy && state.stream) void flush(chatID).catch(() => {})
-      for (const entry of pending.values()) {
-        if (Date.now() - entry.refreshed < 15_000) continue
-        entry.refreshed = Date.now()
+      for (const [token, entry] of pending) {
         const waited = Date.now() - entry.at
-        const shown = `${entry.text}\n\n⏳ ждёт ответа ${clock(waited)} · отклонится само через ${clock(PERMISSION_MS - waited)}`
+        if (waited >= entry.ttl) {
+          log("warn", `permission ${entry.permissionID} timed out, default ${entry.fallback}`)
+          void (async () => {
+            await close(token, `⏱️ Время вышло — ${entry.fallback === "once" ? "разрешено по умолчанию" : "отклонено по умолчанию"}`)
+            await reply(entry.sessionID, entry.permissionID, entry.fallback)
+          })().catch((err) => log("error", `timeout reply: ${String(err)}`))
+          continue
+        }
+        if (Date.now() - entry.refreshed < (entry.ttl <= 60_000 ? 5_000 : 15_000)) continue
+        entry.refreshed = Date.now()
+        const shown = countdown(entry.text, waited, entry.ttl, entry.fallback)
         if (shown === entry.shown) continue
         entry.shown = shown
         void edit(entry.chatID, entry.messageID, shown, entry.keyboard).catch(() => {})

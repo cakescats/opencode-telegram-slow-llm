@@ -5,3 +5,4 @@ telegram-sessions.json
 *.bak*
 backup/
 node_modules/
+telegram-settings.json
