@@ -1,0 +1,7 @@
+# never commit these: token, password, authorised ids, sessions
+telegram.env
+telegram-users.json
+telegram-sessions.json
+*.bak*
+backup/
+node_modules/

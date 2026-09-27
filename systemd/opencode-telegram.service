@@ -1,0 +1,22 @@
+# ~/.config/systemd/user/opencode-telegram.service  (scripts/install.sh writes it for you)
+[Unit]
+Description=opencode server (Telegram bridge for opencode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# the project the agent works in
+WorkingDirectory=%h/PROJECT
+# only this process runs the bot; other opencode processes (the Desktop app) skip it
+Environment=OPENCODE_TELEGRAM_BRIDGE=1
+# protects the local opencode server; any long random string
+Environment=OPENCODE_SERVER_PASSWORD=CHANGE-ME
+ExecStart=/usr/bin/env opencode serve --port 45130 --hostname 127.0.0.1
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
