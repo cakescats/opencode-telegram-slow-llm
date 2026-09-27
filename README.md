@@ -4,7 +4,7 @@
 
 🇬🇧 English · [🇷🇺 Русский](README.ru.md)
 
-A local model at 5–15 tokens a second turns an ordinary agent task into several minutes of thinking, tool calls and confirmations. Bridges written for fast cloud models break on that: they time the task out, show a frozen "typing…", stop reading the chat while the model works, and let confirmation buttons expire before anyone sees them. This one is written for the slow case. It was built and tested with Qwen3.8-Flash-Next (a 125B MoE) served on one 16 GB laptop GPU by [qwfnfer](https://github.com/cakescats/QwFNfer-Secure-RU) at about 10–12 tokens a second.
+A local model at 5–15 tokens a second turns an ordinary agent task into several minutes of thinking, tool calls and confirmations. Bridges written for fast cloud models break on that: they time the task out, show a frozen "typing…", stop reading the chat while the model works, and let confirmation buttons expire before anyone sees them. This one is written for the slow case. It was built and tested with Qwen3.8-Flash-Next (a 125B MoE) served on one 16 GB laptop GPU by [qwfnfer](https://github.com/cakescats/QwFNfer-Secure-Multilang) at about 10–12 tokens a second.
 
 The bot talks to its users in Russian; the code, the logs and this document are in English.
 
