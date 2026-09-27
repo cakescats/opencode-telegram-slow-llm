@@ -11,7 +11,7 @@ The bot talks to its users in Russian; the code, the logs and this document are 
 ## What it does for slow inference
 
 - **Never stops listening.** Polling Telegram is independent of the running task: `/stop`, confirmation buttons, a newcomer's password and other chats are handled while the model is still working. A message sent during a task is queued, and the bot says so.
-- **One live "thinking" message, edited every 3 seconds**: elapsed time, the current step, the agent's latest interim note, and the reasoning so far in a collapsible quote. No new message per update, so no spam.
+- **One live "thinking" message, edited every 3 seconds**: elapsed time, the current step, the agent's latest interim note, and the paragraph of reasoning being written right now (it is replaced, not appended, so the message stays short). No new message per update, so no spam.
 - **The answer arrives as its own message** after the thinking, which then settles into "💭 Reasoning · 1:12".
 - **Patient timeouts.** A run is aborted only after 20 minutes without a single event, and never while it waits for your button. A confirmation waits 10 minutes, with a countdown in the message. Both are settings.
 - **Confirmation buttons that answer back.** A toast with your choice, and the request itself is rewritten in place: "✅ Allowed once · 20:17 (waited 0:42)", buttons removed. Timeouts and answers given elsewhere are marked the same way.

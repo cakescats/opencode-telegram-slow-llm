@@ -356,6 +356,19 @@ export default (async ({ client, directory, project, serverUrl }) => {
     const last = stream.messages.at(-1)
     return pieces(stream, "text").filter((p) => p.message !== last).map((p) => p.text.trim())
   }
+  // The last paragraph of a text (after the last blank line); a paragraph with no blank lines
+  // in it falls back to its last lines, and anything over 600 characters keeps its tail.
+  const lastParagraph = (text: string) => {
+    const paras = text.trim().split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)
+    let para = paras.at(-1) ?? ""
+    if (para.length > 600) {
+      const lines = para.split("\n").filter((l) => l.trim())
+      let tail = ""
+      for (let i = lines.length - 1; i >= 0 && tail.length < 300; i--) tail = tail ? `${lines[i]}\n${tail}` : lines[i]
+      para = tail.length > 600 ? `…${tail.slice(-600)}` : `…${tail}`
+    }
+    return para
+  }
   const errorLine = (stream: Stream) =>
     stream.error ? `${/^\p{Extended_Pictographic}/u.test(stream.error) ? "" : "❌ "}${stream.error}` : ""
 
@@ -375,8 +388,9 @@ export default (async ({ client, directory, project, serverUrl }) => {
     const steps = stream.steps.length ? `\n⚙ ${esc(stream.steps.join(" → "))}` : ""
     const note = notesOf(stream).at(-1)
     const interim = note ? `\n📝 ${esc(note.length > 400 ? `…${note.slice(-400)}` : note)}` : ""
-    const thought = pieces(stream, "reasoning").map((p) => p.text.trim()).join("\n\n")
-    const quote = thought ? `\n<blockquote expandable>${esc(thought.length > 3000 ? `…${thought.slice(-3000)}` : thought)}</blockquote>` : ""
+    // Only the paragraph being thought right now, not the whole reasoning growing downwards.
+    const para = lastParagraph(pieces(stream, "reasoning").at(-1)?.text ?? "")
+    const quote = para ? `\n<blockquote>${esc(para)}</blockquote>` : ""
     const tail = stream.error ? `\n\n${esc(errorLine(stream))}` : ""
     return `${head}${steps}${interim}${quote}${tail}`
   }
